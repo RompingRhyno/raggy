@@ -62,6 +62,120 @@ pipx install -e .
 
 For now, cloning + editable install is picked as a preferred installation method, as it allows you to experiment with the demo dataset, run the eval harness, and edit/debug code if needed. In the future, direct install via `uv tool install git+https ...`/`pipx install git+https ...` will be used instead.
 
+## Usage (GUI)
+
+The GUI puts the retrieved document in the main pane and the chat in a sidebar,
+so an answer is something you check against its source rather than a wall of text
+with citations underneath it. It runs as a local web server on the loopback
+interface:
+
+```bash
+make gui
+# or
+raggy-gui
+# or
+uv run raggy-gui --port 8790
+```
+
+Then open http://127.0.0.1:8765. Everything is local: the server binds to
+127.0.0.1, the vectors and the PDF viewer assets ship with the repo, and there is
+no build step (plain HTML/CSS/ES modules).
+
+### Corpora
+
+Instead of one config file, the GUI holds any number of named **corpora**. Each
+corpus is one config file plus **its own DB directory**, kept under
+`~/.raggy/gui/corpora/` (override the location with `RAGGY_GUI_HOME`). Adding a
+corpus means picking a folder or file in the folder browser and naming it — no
+drag-and-drop:
+
+- the folder's files are indexed on the first refresh;
+- switching corpora switches both the DB and the chat;
+- deleting a corpus removes its config and its DB, and never touches your files.
+
+`db_directory` is deliberately not editable per corpus: two corpora sharing one
+DB would diff their file sets against a single manifest and re-embed (or delete)
+the wrong chunks.
+
+### Refresh and what it reports
+
+**Refresh** re-indexes the active corpus through the same incremental logic the
+CLI uses (only added/changed files are re-embedded; deleting a file prunes its
+vectors), then reports per file:
+
+| Reported | Meaning |
+| --- | --- |
+| indexed | read and embedded by this run, with its chunk count |
+| unchanged | already up to date, so no work |
+| failed | supported file that could not be used, with the reason (a corrupt PDF, or a file with no extractable text) |
+| skipped | unsupported extension, or a source that no longer exists |
+| removed | deleted from the sources folder; its vectors are pruned |
+| orphans | chunks in the DB with no file on disk (normally empty) |
+
+Failures are remembered in the manifest, so a broken file is retried on the next
+refresh instead of being re-read as if it were brand new — and a *fixed* file is
+picked up immediately.
+
+### Asking about one file, or with files hidden
+
+Above the question box, two buttons choose what a question is asked of: the whole
+corpus, or the file currently open in the viewer (disabled while nothing is
+open). The choice is sent with the question, so an answer can only be built from
+what it says — not from the whole corpus with the rest filtered out afterwards.
+
+Each row of the file list carries its status as a clickable dot: green means the
+file is in context, red means it is hidden from it. A hidden file is excluded
+server-side from retrieval — its chunks are never retrieved by either the vector
+or the lexical arm — and the set is remembered per corpus. Hiding is about what
+answers may cite, not about what can be read: a hidden file still opens in the
+viewer. The dot draws its border when the row is hovered, which is where the
+"I am looking at this file" gesture actually happens.
+
+### Document viewer and jump-to-citation
+
+The main pane renders PDFs with a bundled pdf.js, text files with line numbers,
+images with their OCR text, and HTML as markup. Clicking a citation:
+
+- **PDF** (native, plus converted DOCX/PPTX) — opens the file at the cited page
+  and highlights the chunk's own text on that page;
+- **text/markdown** — scrolls to the cited line range and highlights the chunk;
+- **HTML** — scrolls to the chunk text in the rendered page;
+- **image** — shows the image next to the chunk's OCR text. Standalone images
+  have no text layer to search, so there is no highlight to jump to; this is the
+  documented v1 fallback for that one format. An image OCR read nothing out of
+  gets no text panel at all, and is hidden from the file list with the other
+  text-less files.
+
+The PDF page is a canvas with pdf.js's text layer over it: one absolutely
+positioned span per text run, transparent, sitting exactly on the rendered
+glyphs, so text can be selected and searched while only the canvas is visible.
+Those spans are positioned by an inline transform that pdf.js computes, but the
+rules that make them absolute — and the scale variable that sizes them — are the
+host's responsibility, since `TextLayer` is the API for building your own viewer.
+They are reproduced in `raggy/gui/web/styles.css` from pdf.js's own
+`web/pdf_viewer.css`, which is vendored alongside the library
+(`python -m raggy.gui.vendor_pdfjs`) so the two can be compared.
+
+### Office documents
+
+With LibreOffice installed, DOCX and PPTX are rendered to PDF once per content
+hash into `<db_directory>/render_cache/` and chunked from that PDF, so their page
+numbers match what the viewer shows and one viewer covers every paged format.
+Conversions are serialized (LibreOffice headless does not tolerate parallel
+invocations) and cached against the same SHA-256 the manifest already uses, so
+editing a document re-renders it and nothing else. Without LibreOffice those
+formats fall back to their native text extraction and the GUI says so; installing
+it later triggers a rebuild of the affected corpus.
+
+An image's OCR text is cached in the same hash-keyed directory
+(`<db_directory>/render_cache/<sha256>/extracted.txt`). Indexing OCRs an image to
+embed it, and the viewer then wants to show that same text beside the image;
+reading it back out of the vector store does not work, because an image's text is
+split into chunks like any other document and the splitter drops separators at
+the window boundaries. Caching it as it is read is what keeps OCR from running a
+second time — otherwise every listing of an image-heavy corpus pays for a pass
+over every image, and on a 29-image corpus that measured 12s against 0.1s.
+
 ## Usage (CLI)
 
 First, run this command inside the cloned repo:
@@ -157,7 +271,15 @@ though not on the whole corpus. The top `rerank_k` chunks survive.
 **[3] Score threshold.** Each chunk carries its reranker score in
 `doc.metadata["relevance_score"]`, and anything below `rerank_threshold` is dropped.
 This keeps `rerank_k` from polluting the context when the corpus has no good answer;
-`0.0` disables it.
+`0.0` disables it. The cutoff is also **fail-open in the large**: when it would
+discard *every* candidate, the best few are passed through instead of nothing. An
+absolute cutoff only means something if the cross-encoder's scale is comparable
+between queries, and it is not — "what documents are in this corpus" or "who wrote
+this paper" score their genuinely relevant chunks near zero, while content questions
+score near one. Emptying the context there does not protect the answer, it just
+guarantees the "I cannot answer" reply and hides the sources that were retrieved.
+The system prompt already tells the model to say when the context does not answer
+the question, so a weak chunk is better evidence than silence.
 
 **[4] Generation.** The survivors are concatenated into `{context}` in
 `system_prompt` and sent to the configured LLM, along with the chat history (in chat
@@ -178,7 +300,11 @@ directory recording these parameters:
 - `chunk_size`
 - `chunk_overlap`
 - `embedding_model`
+- `file_converters` — which DOCX/PPTX → PDF converters were in play (empty when
+  none is installed), since a change there changes the text of every chunk
 - `files` — a `{file path: SHA-256 content hash}` map of every indexed file
+- `attempted` / `failed` — every walkable file, and the subset that could not be
+  used (a corrupt file, or one with no extractable text), each with its hash
 
 The same chunks are also indexed with `bm25s` (a lexical BM25 index), stored in
 `<db_directory>/bm25_index/`, so the lexical half of hybrid retrieval runs
@@ -201,6 +327,12 @@ The BM25 index has no incremental update path, so it is rebuilt after every upda
 from the chunks already stored in Chroma, which needs no embedding calls and no
 re-reading of source files. This should be very fast anyway.
 
+Files that cannot be used (a truncated PDF with a `.pdf` name, a document whose
+text does not survive extraction) are recorded in the manifest's `failed` map
+rather than silently retried forever or counted as indexed: an unchanged failed
+file is left alone, a *changed* one is retried, and an explicit GUI refresh
+retries them all.
+
 ## Demo dataset
 
 This article (https://arxiv.org/abs/2608.06223v1) is used here as a demo dataset. It's an 8-page document -- each page is saved in different file formats (including PDF, plaintext, images, MS Office) and saved inside the `sample_docs` directory. This directory is specified in `config.yaml` by default.
@@ -222,6 +354,7 @@ It computes basic retrieval/generation metrics and produces a summary (both prin
 - [x] Support for popular LLM providers via API keys
 - [x] Conversation memory in chat mode
 - [x] Pydantic validation of config file
+- [x] GUI: named corpora, refresh reporting, document viewer + chat
 - [ ] UX/UI tuning of CLI (improved commands/statuses, etc)
 - [ ] Performance optimizations (DB creation/update, pipeline execution)
 
