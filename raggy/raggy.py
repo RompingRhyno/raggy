@@ -16,6 +16,7 @@ from .indexing import (
 from .llm_factory import ensure_ollama_model
 from .pipeline import build_rag_chain
 from .progress import ProgressCallback
+from .render import make_text_caching_loader
 from .reranker import ensure_reranker_model
 
 logger = logging.getLogger(__name__)
@@ -69,7 +70,7 @@ def _init_db(
     # pulled up front before any embedding work begins.
     ensure_ollama_model(cfg["embedding_model"], progress=progress)
 
-    vectorstore = initialize_db(
+    outcome = initialize_db(
         db_directory=cfg["db_directory"],
         embedding_model=cfg["embedding_model"],
         sources=cfg["sources"],
@@ -77,9 +78,14 @@ def _init_db(
         chunk_overlap=cfg["chunk_overlap"],
         embed_batch_size=cfg["embed_batch_size"],
         progress=progress,
+        # Indexing caches the text it extracts, so nothing has to extract it
+        # again: the GUI shows an image's OCR text from that cache instead of
+        # running OCR a second time (see raggy.render.ExtractedTextCache). The
+        # CLI pays nothing for it — the text is already in hand here.
+        loader=make_text_caching_loader(cfg["db_directory"]),
     )
 
-    return vectorstore
+    return outcome.vectorstore
 
 
 _vectorstore: Chroma | None = None

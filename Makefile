@@ -1,4 +1,4 @@
-.PHONY: config lint format test sure
+.PHONY: config lint format test sure gui
 
 RUN := $(if $(shell command -v uv >/dev/null 2>&1 && echo yes),uv run,)
 
@@ -18,5 +18,8 @@ format: ## Apply ruff formatting
 
 test: ## Run the test suite
 	$(RUN) pytest -q
+
+gui: ## Run the GUI (document viewer + chat) at http://127.0.0.1:8765
+	$(RUN) raggy-gui
 
 sure: lint format test ## lint, format, test

@@ -8,6 +8,7 @@ retrieval time.
 """
 
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -42,24 +43,43 @@ def save_bm25_index(splits: list[Document], db_directory: str) -> None:
     (index_dir / METADATA_FILENAME).write_text(json.dumps(metadata), encoding="utf-8")
 
 
+# How many extra hits a source-filtered pass asks for before discarding the
+# chunks it is not allowed to return. BM25 is the cheap half of hybrid
+# retrieval, so over-fetching costs little and keeps a filtered pass from
+# coming back with fewer candidates than the budget asked for.
+FILTER_OVERFETCH = 50
+
+
 class Bm25sRetriever(BaseRetriever):
     """A LangChain retriever wrapping a persisted ``bm25s`` index.
 
     Loads the BM25 index and the per-chunk metadata saved alongside it during
     building, and returns ``Document`` objects whose ``page_content`` and
     ``metadata`` match the original indexed chunks.
+
+    ``sources`` narrows the pass to the listed files (``None`` or empty means no
+    restriction). The index has no filter of its own — ``bm25s`` ranks the
+    whole corpus — so the restriction is applied to the hits, and the pass asks
+    for more of them than it needs to keep the budget spendable (see
+    :data:`FILTER_OVERFETCH`). Paths are compared as given, so callers pass them
+    already ``normcase``-folded (see :func:`raggy.pipeline.source_filter`).
     """
 
     bm25: bm25s.BM25
     chunks_metadata: list[dict]
     k: int = 10
+    sources: frozenset[str] | None = None
 
     def _get_relevant_documents(self, query: str) -> list[Document]:
         # bm25s raises if k exceeds the corpus size, so a small corpus (or a
         # large retrieval budget) would otherwise fail the query outright.
-        k = min(self.k, len(self.chunks_metadata))
-        if k <= 0:
+        want = min(self.k, len(self.chunks_metadata))
+        if want <= 0:
             return []
+        # A filtered pass has to rank past the hits it will discard, or the arm
+        # comes back with fewer candidates than the budget it was given.
+        ask = min(max(want, FILTER_OVERFETCH), len(self.chunks_metadata))
+        k = ask if self.sources else want
         tokenized = bm25s.tokenize([query], show_progress=False)
         hits, _ = self.bm25.retrieve(
             tokenized, corpus=self.bm25.corpus, k=k, show_progress=False
@@ -67,17 +87,29 @@ class Bm25sRetriever(BaseRetriever):
         docs: list[Document] = []
         for entry in hits[0]:
             idx = int(entry["id"])
-            docs.append(
-                Document(
-                    page_content=entry["text"],
-                    metadata=dict(self.chunks_metadata[idx]),
-                )
-            )
+            metadata = dict(self.chunks_metadata[idx])
+            if self.sources and not _selected(
+                str(metadata.get("source", "")), self.sources
+            ):
+                continue
+            docs.append(Document(page_content=entry["text"], metadata=metadata))
+            if len(docs) >= want:
+                break
         return docs
 
 
-def get_bm25_retriever(db_directory: str, k: int = 10) -> Bm25sRetriever:
+def _selected(source: str, sources: frozenset[str]) -> bool:
+    """True when ``source`` is one of the files a pass is allowed to return."""
+    return os.path.normcase(source) in sources
+
+
+def get_bm25_retriever(
+    db_directory: str, k: int = 10, sources: frozenset[str] | None = None
+) -> Bm25sRetriever:
     """Load the persisted ``bm25s`` index from ``db_directory``.
+
+    ``sources`` restricts the pass to those files; pass paths already
+    ``normcase``-folded (see :func:`raggy.pipeline.source_filter`).
 
     Raises ``FileNotFoundError`` if the index was never built (e.g. hybrid
     search enabled without ever running the DB build step).
@@ -93,4 +125,4 @@ def get_bm25_retriever(db_directory: str, k: int = 10) -> Bm25sRetriever:
     bm25 = bm25s.BM25()
     bm25 = bm25.load(str(index_dir), load_corpus=True, show_progress=False)
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    return Bm25sRetriever(bm25=bm25, chunks_metadata=metadata, k=k)
+    return Bm25sRetriever(bm25=bm25, chunks_metadata=metadata, k=k, sources=sources)

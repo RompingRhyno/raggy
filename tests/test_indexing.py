@@ -32,7 +32,8 @@ def test_initialize_db_ingests_when_collection_empty(tmp_path, monkeypatch):
         embed_batch_size=100,
     )
 
-    assert isinstance(result, FakeVectorstore)
+    assert isinstance(result.vectorstore, FakeVectorstore)
+    assert result.full_rebuild is True
     assert calls["ingest"] == 1
 
 
@@ -126,17 +127,18 @@ def test_initialize_db_rebuilds_when_manifest_differs(tmp_path, monkeypatch):
     )
 
     assert calls["ingest"] == 1
-    assert (tmp_path / "db" / "manifest.yaml").read_text(
-        encoding="utf-8"
-    ) == yaml.safe_dump(
-        {
-            "sources": [str(source_file)],
-            "chunk_size": 500,
-            "chunk_overlap": 50,
-            "embedding_model": "embed-model",
-            "files": indexing.file_fingerprints([str(source_file)]),
-        }
+    manifest = yaml.safe_load(
+        (tmp_path / "db" / "manifest.yaml").read_text(encoding="utf-8")
     )
+    assert manifest["sources"] == [str(source_file)]
+    assert manifest["chunk_size"] == 500
+    assert manifest["chunk_overlap"] == 50
+    assert manifest["embedding_model"] == "embed-model"
+    assert manifest["files"] == indexing.file_fingerprints([str(source_file)])
+    # The walk's file set is recorded separately from the files that made it in,
+    # which is what lets a later run tell "unreadable" from "new".
+    assert manifest["attempted"] == manifest["files"]
+    assert manifest["failed"] == {}
 
 
 def _write_manifest_for(db_directory, source_file, **overrides):
@@ -285,7 +287,7 @@ def test_update_index_deletes_stale_chunks_and_embeds_changed_files(
     monkeypatch.setattr(
         indexing,
         "load_documents",
-        lambda paths, progress=None, on_missing="raise": [
+        lambda paths, progress=None, on_missing="raise", report=None, loader=None: [
             Document(page_content="new text", metadata={"source": str(paths[0])})
         ],
     )

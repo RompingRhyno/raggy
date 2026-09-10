@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>raggy</title>
+<!-- The favicon is an inline data URI: the app must make zero network requests
+     outside its own origin. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2312161d'/%3E%3Cpath d='M8 9h11a5 5 0 0 1 5 5v9H13a5 5 0 0 1-5-5z' fill='none' stroke='%2358a6ff' stroke-width='2.5'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+<header id="topbar" class="topbar">
+  <div class="brand" title="raggy — local document search">raggy</div>
+  <div class="toolbar">
+    <label class="field">
+      <span class="field-label">Corpus</span>
+      <select id="corpus-select" title="Active corpus"></select>
+    </label>
+    <button id="refresh-btn" type="button" class="btn btn-primary">Refresh</button>
+    <button id="add-corpus-btn" type="button" class="btn">Add corpus</button>
+    <button id="delete-corpus-btn" type="button" class="btn btn-danger"
+            title="Remove the active corpus from raggy">Delete corpus</button>
+    <button id="files-toggle" type="button" class="btn btn-ghost" aria-pressed="true"
+            aria-controls="files-panel" title="Show or hide the file list">Files</button>
+  </div>
+  <div id="topbar-note" class="topbar-note" hidden></div>
+</header>
+
+<main id="workspace" class="workspace">
+
+  <aside id="files-panel" class="panel files-panel">
+    <div class="panel-head">
+      <h2 class="panel-title">Files</h2>
+      <div class="panel-head-side">
+        <span id="file-counts" class="pill"></span>
+        <!-- Hidden by default: a file that produced no text contributes nothing
+             to an answer, so it is noise in the list until asked for. -->
+        <button id="empty-files-toggle" type="button" class="btn btn-ghost btn-small"
+                aria-pressed="false"
+                title="Files that produced no text (unreadable, or nothing extractable)">No text</button>
+      </div>
+    </div>
+    <div id="file-list" class="file-list" role="list"></div>
+  </aside>
+
+  <section class="panel viewer-panel" aria-label="Document viewer">
+    <div class="panel-head">
+      <h2 id="viewer-title" class="panel-title">No document open</h2>
+      <div class="panel-head-side">
+        <span id="viewer-status" class="pill" hidden></span>
+        <div id="pdf-controls" class="pdf-controls" hidden>
+          <button id="pdf-prev" type="button" class="btn btn-small" title="Previous page">‹</button>
+          <span id="pdf-pageinfo" class="pager">– / –</span>
+          <button id="pdf-next" type="button" class="btn btn-small" title="Next page">›</button>
+        </div>
+      </div>
+    </div>
+    <div id="viewer" class="viewer"></div>
+  </section>
+
+  <aside id="chat-panel" class="panel chat-panel">
+    <div class="panel-head">
+      <h2 class="panel-title">Ask</h2>
+      <button id="clear-chat-btn" type="button" class="btn btn-ghost btn-small">Clear</button>
+    </div>
+    <div id="chat-log" class="chat-log"></div>
+    <form id="chat-form" class="chat-form">
+      <!-- What the question is asked of. The current file is the interesting
+           scope when a document is open; "all files" is what the pane does
+           otherwise, and both stay visible so the choice is never a mystery. -->
+      <div class="ask-scope" role="group" aria-label="Ask about" title="Which files the answer may come from">
+        <button id="scope-all" type="button" class="btn btn-ghost btn-small" aria-pressed="true">All files</button>
+        <button id="scope-file" type="button" class="btn btn-ghost btn-small" aria-pressed="false" disabled>This file</button>
+        <span id="scope-note" class="ask-scope-note"></span>
+      </div>
+      <textarea id="query-input" rows="3" placeholder="Ask a question about this corpus…"
+                autocomplete="off" spellcheck="false"></textarea>
+      <div class="chat-actions">
+        <span id="query-state" class="chat-state"></span>
+        <button id="send-btn" type="submit" class="btn btn-primary">Send</button>
+      </div>
+    </form>
+  </aside>
+
+</main>
+
+<!-- Blocking refresh: covers the whole window, because a refresh takes the
+     corpus lock and every other control would be refused with a 409 anyway. -->
+<div id="refresh-overlay" class="overlay" hidden>
+  <div class="overlay-card" role="status" aria-live="polite">
+    <div class="spinner" aria-hidden="true"></div>
+    <h2 class="overlay-title">Refreshing index</h2>
+    <p id="refresh-message" class="overlay-message">starting…</p>
+    <p id="refresh-elapsed" class="overlay-elapsed">0s elapsed</p>
+    <button id="refresh-cancel" type="button" class="btn btn-small">Hide this panel</button>
+    <p class="overlay-foot">Indexing continues in the background; the report appears when it finishes.</p>
+  </div>
+</div>
+
+<div id="add-corpus-modal" class="modal" hidden>
+  <div class="modal-backdrop" data-action="close"></div>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="add-corpus-title">
+    <div class="modal-head">
+      <h2 id="add-corpus-title" class="panel-title">Add corpus</h2>
+      <button id="browse-close" type="button" class="btn btn-ghost btn-small">Close</button>
+    </div>
+    <p class="modal-hint">
+      Pick one or more folders to index. raggy indexes the files inside them; add
+      files to those folders and press Refresh to pick up changes.
+    </p>
+    <div class="browse-path-row">
+      <button id="browse-up" type="button" class="btn btn-small" title="Parent folder">↑ Up</button>
+      <button id="browse-home" type="button" class="btn btn-small">Home</button>
+      <code id="browse-path" class="browse-path"></code>
+    </div>
+    <div id="browse-selection" class="browse-selection"></div>
+    <ul id="browse-list" class="browse-list"></ul>
+    <div id="add-corpus-error" class="error-box" hidden></div>
+    <div class="modal-foot">
+      <div class="field grow">
+        <label class="field-label" for="corpus-name">Name</label>
+        <input id="corpus-name" type="text" placeholder="e.g. Papers" autocomplete="off">
+        <!-- What will actually be indexed: the ticked folders, or the one being
+             browsed when nothing is ticked. Without this the last case looks
+             like the app guessing. -->
+        <span id="corpus-sources" class="field-note"></span>
+      </div>
+      <button id="browse-use-current" type="button" class="btn">Use this folder</button>
+      <button id="browse-create" type="button" class="btn btn-primary">Add corpus</button>
+    </div>
+  </div>
+</div>
+
+<div id="delete-corpus-modal" class="modal" hidden>
+  <div class="modal-backdrop" data-action="cancel"></div>
+  <div class="modal-card modal-card-narrow" role="dialog" aria-modal="true"
+       aria-labelledby="delete-corpus-title">
+    <h2 id="delete-corpus-title" class="panel-title">Delete corpus</h2>
+    <!-- The name is filled in by app.js, so it is never a placeholder here: the
+         dialog has to say which corpus it is about, not just "a corpus". -->
+    <p id="delete-corpus-warning" class="modal-warning"></p>
+    <p class="modal-hint modal-hint-plain">
+      The files themselves are left alone — only raggy's copy of them is
+      removed. Indexing the folder again later rebuilds the corpus from scratch.
+    </p>
+    <div id="delete-corpus-error" class="error-box" hidden></div>
+    <div class="modal-foot modal-foot-end">
+      <button id="delete-corpus-cancel" type="button" class="btn">Cancel</button>
+      <button id="delete-corpus-confirm" type="button" class="btn btn-danger">Delete</button>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>

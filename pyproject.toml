@@ -48,6 +48,9 @@ dependencies = [
     "bm25s",
     "pytest",
     "ruff>=0.16.1",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "python-multipart>=0.0.9",
 ]
 
 [tool.pytest.ini_options]
@@ -60,8 +63,12 @@ filterwarnings = [
 where = ["."]
 include = ["raggy*"]
 
+[tool.setuptools.package-data]
+raggy = ["gui/web/**/*", "gui/web/*"]
+
 [project.scripts]
 raggy = "raggy.cli:main"
+raggy-gui = "raggy.gui.__main__:main"
 
 [project.urls]
 Homepage = "https://github.com/paulknysh/raggy"

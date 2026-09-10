@@ -1,6 +1,7 @@
 import io
 import logging
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
 
@@ -444,4 +445,6 @@ def test_banner_names_the_config_in_use(monkeypatch, captured_console, stub_conf
 
     cli.run_chat("/tmp/other.yaml")
 
-    assert "/tmp/other.yaml" in _output(captured_console)
+    # The banner prints the resolved path, so the expectation is resolved too:
+    # "/tmp/other.yaml" is "D:\tmp\other.yaml" on Windows.
+    assert str(Path("/tmp/other.yaml").resolve()) in _output(captured_console)

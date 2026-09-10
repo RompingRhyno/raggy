@@ -2,7 +2,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from raggy import raggy
+from raggy import loaders, raggy
+from raggy.indexing import IndexOutcome, IndexPlan
 
 
 def test_load_config_raises_for_missing_file(tmp_path):
@@ -461,7 +462,7 @@ def test_load_config_coerces_numeric_strings(tmp_path):
     assert cfg["retrieve_k"] == 5
 
 
-def test_init_db_forwards_config_to_initialize_db(monkeypatch):
+def test_init_db_forwards_config_to_initialize_db(monkeypatch, tmp_path):
     fake_cfg = {
         "sources": ["./docs"],
         "db_directory": "./persist",
@@ -480,13 +481,23 @@ def test_init_db_forwards_config_to_initialize_db(monkeypatch):
 
     def fake_initialize_db(**kwargs):
         captured.update(kwargs)
-        return sentinel
+        # _init_db unwraps the outcome's store; the plan/manifest it also
+        # carries are for callers that report on the run.
+        return IndexOutcome(
+            vectorstore=sentinel,
+            plan=IndexPlan(),
+            manifest={},
+            collection_was_empty=True,
+        )
 
     monkeypatch.setattr(raggy, "initialize_db", fake_initialize_db)
 
     result = raggy._init_db()
 
     assert result is sentinel
+    # `loader` is the text-caching wrapper, checked separately below: it is a
+    # closure, so it cannot be compared as part of the dict.
+    loader = captured.pop("loader", None)
     assert captured == {
         "db_directory": "./persist",
         "embedding_model": "embed-x",
@@ -496,6 +507,19 @@ def test_init_db_forwards_config_to_initialize_db(monkeypatch):
         "embed_batch_size": 100,
         "progress": None,
     }
+    assert loader is not None, "indexing must cache the text it extracts"
+
+    # It wraps the native loader and caches into this corpus's directory.
+    image = tmp_path / "scan.png"
+    image.write_bytes(b"not really a png")
+    calls = []
+    monkeypatch.setattr(
+        loaders,
+        "_extracted_text",
+        lambda path, text_cache=None: calls.append(text_cache) or "TEXT",
+    )
+    assert [doc.page_content for doc in loader(image)] == ["TEXT"]
+    assert calls[0] is not None, "the wrapper must pass a cache to the image loader"
 
 
 def test_run_pipeline_returns_response_and_retrieved_docs(monkeypatch):
@@ -953,7 +977,16 @@ def test_init_db_reads_the_given_config(monkeypatch):
     monkeypatch.setattr(
         raggy, "ensure_ollama_model", lambda model, progress=None: False
     )
-    monkeypatch.setattr(raggy, "initialize_db", lambda **kwargs: object())
+    monkeypatch.setattr(
+        raggy,
+        "initialize_db",
+        lambda **kwargs: IndexOutcome(
+            vectorstore=object(),
+            plan=IndexPlan(),
+            manifest={},
+            collection_was_empty=True,
+        ),
+    )
 
     raggy._init_db(config_path="/tmp/other.yaml")
 

@@ -1,5 +1,6 @@
 import logging
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -11,6 +12,7 @@ from langchain_community.document_loaders import (
 )
 from langchain_core.documents import Document
 
+from .hashes import hash_file
 from .progress import ProgressCallback
 
 logger = logging.getLogger(__name__)
@@ -40,6 +42,126 @@ LINE_ANNOTATED_EXTENSIONS = {".txt", ".md", ".markdown"}
 DEFAULT_OCR_DPI = 150
 
 
+@dataclass(frozen=True)
+class FileSkip:
+    """A file the walk found but that raggy cannot use.
+
+    ``reason`` is ``"unsupported"`` (an extension raggy has no loader for) or
+    ``"missing"`` (a source entry that no longer exists). Kept as data rather
+    than a log line so a front end can report what was left out instead of
+    making the user read the log.
+    """
+
+    path: str
+    reason: Literal["unsupported", "missing"]
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class FileFailure:
+    """A supported file that was read and failed to load."""
+
+    path: str
+    error: str
+
+
+@dataclass
+class LoadReport:
+    """What a load pass did, per file.
+
+    ``skipped`` carries the files the walk rejected (see :class:`FileSkip`),
+    and ``failed`` the supported files whose loader raised. Callers that do not
+    pass a report keep the previous behaviour: skips and failures are logged
+    only.
+
+    ``chunkless`` is filled in one step later, by the indexer: a file can load
+    perfectly and still be worth reporting as a failure, because its text was
+    empty (a blank DOCX) or nothing survived chunking. Such a file has no chunks
+    to retrieve, so counting it as indexed would be a lie the corpus pays for.
+    """
+
+    documents: list[Document] = field(default_factory=list)
+    skipped: list[FileSkip] = field(default_factory=list)
+    failed: list[FileFailure] = field(default_factory=list)
+    paths: list[str] = field(default_factory=list)
+    chunkless: list[str] = field(default_factory=list)
+
+    @property
+    def loaded_paths(self) -> list[str]:
+        """The ``source`` of every file that produced at least one document."""
+        seen: dict[str, None] = {}
+        for doc in self.documents:
+            source = doc.metadata.get("source")
+            if source:
+                seen.setdefault(str(source), None)
+        return list(seen)
+
+    def attempted_paths(self) -> list[str]:
+        """Every supported file the walk handed to a loader, in walk order."""
+        return list(self.paths)
+
+
+def _record_unsupported(skipped: list[Path], report: LoadReport | None) -> None:
+    """Mirror the walk's skipped files into ``report``, keyed by path."""
+    if report is None:
+        return
+    known = {entry.path for entry in report.skipped}
+    for path in skipped:
+        if str(path) not in known:
+            report.skipped.append(
+                FileSkip(
+                    path=str(path), reason="unsupported", detail=path.suffix.lower()
+                )
+            )
+
+
+def _record_missing(missing: list[Path], report: LoadReport | None) -> None:
+    """Mirror source entries that no longer exist into ``report``."""
+    if report is None:
+        return
+    known = {entry.path for entry in report.skipped}
+    for path in missing:
+        if str(path) not in known:
+            report.skipped.append(FileSkip(path=str(path), reason="missing"))
+
+
+def file_failures(report: LoadReport) -> tuple[dict[str, str], dict[str, str]]:
+    """Split a load report into ``(attempted, failed)`` fingerprint-shaped maps.
+
+    Both maps are ``{file path: sha256}`` — for every file the walk handed to a
+    loader, and for the subset that contributed nothing. They are fingerprints
+    rather than messages because the manifest diffs them on the next run; the
+    *reason* each file failed is what :func:`failure_reasons` returns. Files that
+    vanished between the walk and here are dropped rather than recorded: they are
+    a race, not a property of the corpus.
+    """
+    suspect = {failure.path for failure in report.failed} | set(report.chunkless)
+
+    attempted: dict[str, str] = {}
+    for path in set(report.attempted_paths()) | suspect:
+        try:
+            attempted[path] = hash_file(path)
+        except OSError:
+            continue
+
+    failed = {path: attempted[path] for path in suspect if path in attempted}
+    return attempted, failed
+
+
+def failure_reasons(report: LoadReport) -> dict[str, str]:
+    """Why each failed file contributed nothing, keyed by path.
+
+    A file fails either because its loader raised or because nothing survived
+    extraction and chunking (a blank DOCX, an image with no recognizable text).
+    Both mean the same thing to a user looking at the report, so both are
+    reported here; the distinction between them is only in the message.
+    """
+    reasons = {failure.path: failure.error for failure in report.failed}
+    for path in report.chunkless:
+        reasons.setdefault(path, "no text could be extracted from this file")
+    return reasons
+
+
 _ocr_engine = None
 
 
@@ -62,10 +184,34 @@ def _ocr_image_bytes(image_bytes: bytes) -> str:
     return "\n".join(text for text in result.txts if text)
 
 
-def _load_image(path: Path) -> list[Document]:
-    """OCR a single image file into one Document."""
-    text = _ocr_image_bytes(path.read_bytes())
+def _load_image(path: Path, text_cache=None) -> list[Document]:
+    """OCR a single image file into one Document.
+
+    ``text_cache`` is the :class:`raggy.render.ExtractedTextCache` of the corpus
+    being indexed, when there is one. OCR is the most expensive extraction raggy
+    does per byte and its result is wanted twice — once to be embedded, and again
+    to be shown beside the image — so it is cached while it is in hand and read
+    back from there afterwards. Without a cache (a caller that passes none) this
+    is exactly the OCR pass it always was.
+    """
+    text = _extracted_text(path, text_cache)
     return [Document(page_content=text, metadata={"source": str(path)})]
+
+
+def _extracted_text(path: Path, text_cache=None) -> str:
+    """The text of an image file: from ``text_cache`` if it has it, else OCR.
+
+    The single place OCR is run and cached, so every caller — the indexer and
+    whatever displays the text later — goes through the same cache.
+    """
+    if text_cache is not None:
+        cached = text_cache.read(path)
+        if cached is not None:
+            return cached
+    text = _ocr_image_bytes(path.read_bytes())
+    if text_cache is not None:
+        text_cache.store(path, text)
+    return text
 
 
 def _load_ocr_pdf(path: Path) -> list[Document]:
@@ -134,12 +280,56 @@ def _load_pptx(path: Path) -> list[Document]:
     return documents
 
 
-def _load_file(path: Path) -> list[Document]:
+def source_kind(path: Path) -> str:
+    """Classify a source file for the viewer: how its content should render.
+
+    ``"pdf"`` for native PDFs, ``"image"`` for OCR'd images, ``"text"`` for the
+    plain-text formats that carry line numbers, ``"html"`` for web pages, and
+    ``"office"`` for the DOCX/PPTX pair that the GUI converts to PDF for
+    display. Derived from the extension alone so it can be stamped onto chunks
+    at index time and read back at display time.
+    """
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        return "pdf"
+    if suffix in IMAGE_EXTENSIONS:
+        return "image"
+    if suffix in LINE_ANNOTATED_EXTENSIONS:
+        return "text"
+    if suffix in {".html", ".htm"}:
+        return "html"
+    if suffix in {".docx", ".pptx"}:
+        return "office"
+    return "text"
+
+
+def _finish_loaded(path: Path, documents: list[Document]) -> list[Document]:
+    """Stamp the viewer hints every chunk of a loaded file carries.
+
+    ``source`` is the path the user knows (also the manifest key), and
+    ``source_kind`` tells the GUI which viewer to open. Both are written here,
+    once per loaded file, so chunk metadata stays consistent across formats —
+    including the conversion path, whose loader loads a cached PDF but must
+    still attribute the chunks to the original document.
+    """
+    kind = source_kind(path)
+    for doc in documents:
+        doc.metadata["source"] = str(path)
+        doc.metadata["source_kind"] = kind
+    return documents
+
+
+def _load_file(path: Path, text_cache=None) -> list[Document]:
     """Load documents from a single supported file based on its extension.
 
     Callers reach this only through :func:`source_files`, which is what decides
     a file is supported, so the extension is dispatched on here but never
-    re-checked.
+    re-checked. Every returned document has its ``source``/``source_kind``
+    metadata normalized by :func:`_finish_loaded`.
+
+    ``text_cache`` is the optional :class:`raggy.render.ExtractedTextCache` for
+    the corpus being indexed; it is passed to the image path, the one loader
+    whose output a viewer needs again later (see :func:`_load_image`).
     """
     suffix = path.suffix.lower()
     if suffix == ".pdf":
@@ -151,22 +341,23 @@ def _load_file(path: Path) -> list[Document]:
         if not any((doc.page_content or "").strip() for doc in documents):
             logger.info("No extractable text in '%s'; falling back to OCR...", path)
             documents = _load_ocr_pdf(path)
-        return documents
+        return _finish_loaded(path, documents)
 
     if suffix in IMAGE_EXTENSIONS:
-        return _load_image(path)
+        return _finish_loaded(path, _load_image(path, text_cache))
 
     if suffix == ".docx":
-        return Docx2txtLoader(str(path)).load()
+        return _finish_loaded(path, Docx2txtLoader(str(path)).load())
 
     if suffix == ".pptx":
-        return _load_pptx(path)
+        return _finish_loaded(path, _load_pptx(path))
 
     if suffix in {".html", ".htm"}:
-        return BSHTMLLoader(str(path), open_encoding="utf-8").load()
+        return _finish_loaded(
+            path, BSHTMLLoader(str(path), open_encoding="utf-8").load()
+        )
 
-    loader = TextLoader(str(path), encoding="utf-8")
-    return loader.load()
+    return _finish_loaded(path, TextLoader(str(path), encoding="utf-8").load())
 
 
 def annotate_line_numbers(splits: list[Document], content: str) -> None:
@@ -233,25 +424,43 @@ def source_label(doc) -> str:
 
 
 def _walk_source(root: Path, skipped: list[Path]) -> Iterator[Path]:
-    """Yield the supported files one source entry contributes, in load order."""
+    """Yield the supported files one source entry contributes, in load order.
+
+    Paths are canonicalized (:meth:`Path.resolve`) because they become the
+    corpus's identity in three places at once — the manifest's fingerprint keys,
+    each chunk's ``source`` metadata, and the ``?path=`` a GUI sends back when it
+    opens a cited document. Anything less than one canonical spelling on this
+    machine (Windows in particular, where an 8.3 ``ADMINI~1`` path and its long
+    form are the same file) makes those three disagree about a file that has not
+    changed, which reads as churn.
+    """
     if root.is_dir():
         for file_path in sorted(root.rglob("*")):
             if not file_path.is_file():
                 continue
             if file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
-                skipped.append(file_path)
+                skipped.append(_canonical(file_path))
                 continue
-            yield file_path
+            yield _canonical(file_path)
     elif root.suffix.lower() in SUPPORTED_EXTENSIONS:
-        yield root
+        yield _canonical(root)
     else:
-        skipped.append(root)
+        skipped.append(_canonical(root))
+
+
+def _canonical(path: Path) -> Path:
+    """The single spelling of ``path`` used everywhere a file is identified."""
+    try:
+        return path.resolve()
+    except OSError:  # pragma: no cover - unresolvable path (broken link, perms)
+        return path
 
 
 def source_files(
     sources: Sequence[str | Path],
     skipped: list[Path] | None = None,
     on_missing: Literal["raise", "skip"] = "raise",
+    report: LoadReport | None = None,
 ) -> list[Path]:
     """Return every supported file under ``sources``, in the order it is indexed.
 
@@ -265,7 +474,8 @@ def source_files(
     raising, and a directory holding none simply contributes nothing. A file
     reachable through more than one entry is returned once, at its first
     position. ``on_missing`` decides what an entry that no longer exists means
-    (see :func:`load_documents`).
+    (see :func:`load_documents`); ``report`` additionally records the skipped
+    and missing entries as data.
     """
     if on_missing not in ("raise", "skip"):
         raise ValueError(f"on_missing must be 'raise' or 'skip', got {on_missing!r}")
@@ -275,7 +485,6 @@ def source_files(
     for source in sources:
         path = Path(source)
         (paths if path.exists() else missing).append(path)
-
     if missing and on_missing == "raise":
         raise FileNotFoundError(
             "Source document(s) not found at: "
@@ -283,6 +492,12 @@ def source_files(
         )
     for path in missing:
         logger.warning("Skipping '%s': file no longer exists.", path)
+    _record_missing(missing, report)
+
+    # Source entries are canonicalized too: they are recorded in the manifest and
+    # compared on every run, so the short (``ADMINI~1``) and long spellings of one
+    # directory must not look like a configuration change.
+    paths = [_canonical(path) for path in paths]
 
     files: list[Path] = []
     seen: set[Path] = set()
@@ -308,21 +523,35 @@ def source_files(
 def _load_each(
     paths: list[Path],
     progress: ProgressCallback | None,
+    report: LoadReport | None = None,
+    loader: Callable[[Path], list[Document]] = _load_file,
 ) -> list[Document]:
     """Load every path in turn, reporting each one and skipping what fails.
 
     A file that cannot be read is logged and passed over rather than aborting
-    the run: one unreadable file should not cost an otherwise good corpus.
+    the run: one unreadable file should not cost an otherwise good corpus. With
+    a ``report``, the failure is also recorded there (path + error message) so a
+    front end can show which files were left out instead of only logging them.
+
+    ``loader`` reads one path into documents; the conversion path passes its
+    own so DOCX/PPTX are read from their cached PDF while keeping their
+    original ``source`` path.
     """
     total = len(paths)
     documents: list[Document] = []
     for index, path in enumerate(paths, start=1):
         if progress is not None:
             progress(f"[{index}/{total}] ingesting {path.name} ...")
+        if report is not None:
+            report.paths.append(str(path))
         try:
-            documents.extend(_load_file(path))
+            documents.extend(loader(path))
         except Exception as e:  # noqa: BLE001
             logger.warning("Failed to load '%s': %s", path, e)
+            if report is not None:
+                report.failed.append(
+                    FileFailure(path=str(path), error=str(e) or repr(e))
+                )
     return documents
 
 
@@ -348,6 +577,8 @@ def load_documents(
     sources: Sequence[str | Path],
     progress: ProgressCallback | None = None,
     on_missing: Literal["raise", "skip"] = "raise",
+    report: LoadReport | None = None,
+    loader: Callable[[Path], list[Document]] = _load_file,
 ) -> list[Document]:
     """Load documents from files and/or directories.
 
@@ -363,9 +594,17 @@ def load_documents(
     its file list was fingerprinted earlier in the same run, so a file deleted
     since then is expected, and dropping it beats aborting the whole update —
     the next run reconciles it as a deletion.
+
+    ``report`` (optional) collects the per-file outcome the log lines carry:
+    unsupported/missing entries in ``report.skipped`` and load failures in
+    ``report.failed``. ``loader`` overrides how one path becomes documents (the
+    DOCX/PPTX conversion path reads the cached PDF instead of the source file).
     """
     skipped: list[Path] = []
-    files = source_files(sources, skipped, on_missing=on_missing)
-    documents = _load_each(files, progress)
+    files = source_files(sources, skipped, on_missing=on_missing, report=report)
+    _record_unsupported(skipped, report)
+    documents = _load_each(files, progress, report, loader)
     _report_unsupported(skipped, bool(documents))
+    if report is not None:
+        report.documents = documents
     return documents

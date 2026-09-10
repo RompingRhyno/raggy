@@ -19,6 +19,10 @@ env/
 .mypy_cache/
 .ruff_cache/
 
+# The front-end smoke test mirrors the served modules here so Node can import
+# them (see tests/js/frontend_smoke.mjs)
+tests/js/.frontend-smoke/
+
 # IDE/editor
 .vscode/
 .idea/
@@ -30,3 +34,6 @@ env/
 db/
 eval/results.json
 config.yaml
+
+# GUI state when RAGGY_GUI_HOME points into the checkout
+.raggy/

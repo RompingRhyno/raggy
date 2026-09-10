@@ -97,7 +97,22 @@ def test_get_llm_unknown_provider_raises():
         llm_factory.get_llm("grok", "grok-1", 0.0)
 
 
+def without_the_api(monkeypatch):
+    """Force the CLI fallback: pretend the Ollama server cannot be reached.
+
+    Presence is normally checked over the HTTP API first (the Windows desktop
+    app installs a server with no CLI on PATH), so these CLI-focused tests have
+    to take the API out of the picture to exercise the branch they are about.
+    """
+
+    def unavailable():
+        raise ConnectionError("connection refused")
+
+    monkeypatch.setattr(llm_factory, "_installed_models_via_api", unavailable)
+
+
 def test_ensure_ollama_model_already_present(monkeypatch):
+    without_the_api(monkeypatch)
     monkeypatch.setattr(llm_factory.shutil, "which", lambda _: "/usr/local/bin/ollama")
 
     def fake_run(cmd, **kwargs):
@@ -121,6 +136,7 @@ def test_ensure_ollama_model_already_present(monkeypatch):
 
 
 def test_ensure_ollama_model_pulls_missing(monkeypatch):
+    without_the_api(monkeypatch)
     monkeypatch.setattr(llm_factory.shutil, "which", lambda _: "/usr/local/bin/ollama")
     calls = []
 
@@ -141,12 +157,40 @@ def test_ensure_ollama_model_pulls_missing(monkeypatch):
 
 
 def test_ensure_ollama_model_no_cli_raises(monkeypatch):
+    without_the_api(monkeypatch)
     monkeypatch.setattr(llm_factory.shutil, "which", lambda _: None)
-    with pytest.raises(RuntimeError, match="ollama CLI not found"):
+    with pytest.raises(RuntimeError, match="CLI is not on"):
         llm_factory.ensure_ollama_model("llama3.2")
 
 
+def test_ensure_ollama_model_uses_the_api_when_it_is_reachable(monkeypatch):
+    """The Windows desktop app runs a server with no CLI on PATH."""
+    monkeypatch.setattr(
+        llm_factory, "_installed_models_via_api", lambda: {"llama3.2:latest"}
+    )
+    monkeypatch.setattr(llm_factory.shutil, "which", lambda _: None)
+
+    assert llm_factory.ensure_ollama_model("llama3.2") is False
+
+
+def test_ensure_ollama_model_pulls_over_the_api_without_a_cli(monkeypatch):
+    """A model missing from a CLI-less install is still fetched, over the API."""
+    monkeypatch.setattr(llm_factory, "_installed_models_via_api", lambda: set())
+    monkeypatch.setattr(llm_factory.shutil, "which", lambda _: None)
+    pulled = []
+
+    def fake_pull(model, stream=False):
+        pulled.append((model, stream))
+        return []
+
+    monkeypatch.setattr("ollama.pull", fake_pull)
+
+    assert llm_factory.ensure_ollama_model("llama3.2") is True
+    assert pulled == [("llama3.2", True)]
+
+
 def test_ensure_ollama_model_already_present_with_explicit_latest_tag(monkeypatch):
+    without_the_api(monkeypatch)
     monkeypatch.setattr(llm_factory.shutil, "which", lambda _: "/usr/local/bin/ollama")
 
     def fake_run(cmd, **kwargs):
@@ -164,6 +208,7 @@ def test_ensure_ollama_model_already_present_with_explicit_latest_tag(monkeypatc
 
 
 def test_ensure_ollama_model_missing_tag_triggers_pull(monkeypatch):
+    without_the_api(monkeypatch)
     monkeypatch.setattr(llm_factory.shutil, "which", lambda _: "/usr/local/bin/ollama")
     calls = []
 
@@ -186,6 +231,7 @@ def test_ensure_ollama_model_missing_tag_triggers_pull(monkeypatch):
 
 
 def test_ensure_ollama_model_pull_failure_raises_runtime_error(monkeypatch):
+    without_the_api(monkeypatch)
     monkeypatch.setattr(llm_factory.shutil, "which", lambda _: "/usr/local/bin/ollama")
 
     def fake_run(cmd, **kwargs):
@@ -217,6 +263,7 @@ def _fake_pull_module(events, calls):
 
 
 def test_ensure_ollama_model_streams_pull_progress(monkeypatch):
+    without_the_api(monkeypatch)
     monkeypatch.setattr(llm_factory.shutil, "which", lambda _: "/usr/local/bin/ollama")
 
     ran = []
@@ -264,6 +311,7 @@ def test_ensure_ollama_model_streams_pull_progress(monkeypatch):
 
 
 def test_ensure_ollama_model_streamed_pull_failure_raises_runtime_error(monkeypatch):
+    without_the_api(monkeypatch)
     monkeypatch.setattr(llm_factory.shutil, "which", lambda _: "/usr/local/bin/ollama")
 
     def fake_run(cmd, **kwargs):

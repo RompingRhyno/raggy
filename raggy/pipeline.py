@@ -1,4 +1,5 @@
 import logging
+import os
 from collections.abc import Sequence
 
 from langchain_chroma import Chroma
@@ -98,6 +99,11 @@ class ScoreAnnotatingReranker(BaseDocumentCompressor):
         return [doc for doc, _ in ranked[: self.top_n]]
 
 
+# How many of the best candidates survive when the threshold would discard every
+# one of them (see filter_by_score_threshold).
+_FALLBACK_CONTEXT_CHUNKS = 3
+
+
 def filter_by_score_threshold(
     docs: list[Document], threshold: float | None
 ) -> list[Document]:
@@ -106,10 +112,33 @@ def filter_by_score_threshold(
     Documents without a stored score are kept, so this is fail-open. A
     ``threshold`` of ``None`` or ``<= 0`` disables the filter entirely and
     returns ``docs`` unchanged. Order is preserved.
+
+    The filter is also fail-open *in the large*: if it would discard every scored
+    candidate, the best ``_FALLBACK_CONTEXT_CHUNKS`` are kept rather than nothing.
+    An absolute cutoff only means something when the cross-encoder's scale is
+    comparable from query to query, and it is not: questions about the corpus or
+    the document rather than its contents ("what documents are in this corpus",
+    "who wrote this paper") score their genuinely relevant chunks near zero, while
+    content questions score near one. Discarding the lot there does not protect
+    the answer — it guarantees the "I cannot answer" reply and hides sources that
+    were in fact retrieved. Passing the best few through costs little: the system
+    prompt already instructs the model to say when the context does not answer the
+    question, and a weak chunk now at least appears as a citation the reader can
+    judge for themselves.
     """
     if not threshold or threshold <= 0:
         return docs
-    return [d for d in docs if d.metadata.get(SCORE_KEY, float("inf")) >= threshold]
+    kept = [d for d in docs if d.metadata.get(SCORE_KEY, float("inf")) >= threshold]
+    if kept:
+        return kept
+
+    ranked = sorted(
+        (d for d in docs if SCORE_KEY in d.metadata),
+        key=lambda d: d.metadata[SCORE_KEY],
+        reverse=True,
+    )
+    fallback = {id(doc) for doc in ranked[:_FALLBACK_CONTEXT_CHUNKS]}
+    return [d for d in docs if id(d) in fallback or SCORE_KEY not in d.metadata]
 
 
 def split_retrieval_budget(retrieve_k: int, hybrid_alpha: float) -> tuple[int, int]:
@@ -130,6 +159,68 @@ def split_retrieval_budget(retrieve_k: int, hybrid_alpha: float) -> tuple[int, i
     return k_dense, k_sparse
 
 
+def source_filter(
+    include_sources: Sequence[str] | None,
+    exclude_sources: Sequence[str] | None,
+    all_sources: Sequence[str] | None = None,
+) -> tuple[dict | None, frozenset[str] | None]:
+    """Turn a retrieval scope into a store filter and an exact allow-list.
+
+    The two retrieval arms need the same scope expressed two different ways: a
+    metadata filter for the dense arm, which can be told what *not* to return,
+    and an allow-list for the lexical arm, which cannot — ``bm25s`` ranks the
+    whole corpus and its only way to exclude a file is to be told everything it
+    *is* allowed to return. ``all_sources`` is the corpus's own file list,
+    which is what turns "everything except these" into that allow-list; without
+    it an exclusion still filters the dense arm but is reported as unfiltered
+    (``None``) for the lexical one, because guessing the corpus contents would
+    be worse than a wider lexical pass.
+
+    ``include_sources`` restricts the pass to those files (empty/None means the
+    whole corpus); ``exclude_sources`` removes files from whatever that
+    selected. A file named in both is excluded — the exclusion is the more
+    recent instruction, and the user who just clicked a file off should not
+    have it reappear because a scope still names it.
+
+    Both outputs are folded with ``normcase``, the folding Windows itself
+    applies, because callers hand back whatever the file list showed them and a
+    path that differs only in case is the same file. The filter is the
+    exception: it is compared by the store against the exact string the index
+    recorded, so each path is looked up in ``all_sources`` first and the
+    corpus's own spelling is what goes into the filter. Without that, asking
+    about a file the index recorded as ``D:\\Docs\\A.pdf`` with the path folded
+    to ``d:\\docs\\a.pdf`` would quietly select nothing.
+
+    Chroma rejects an empty operand list rather than treating it as a no-op
+    (``$in []`` raises), so a scope that selects nothing comes back with no
+    filter at all; that is the caller's cue to refuse the question rather than
+    ask it of an empty context.
+    """
+    keep = {os.path.normcase(str(source)) for source in include_sources or ()}
+    drop = {os.path.normcase(str(source)) for source in exclude_sources or ()}
+    keep -= drop
+    # The corpus's own spelling of each file, keyed by its folded form: the
+    # store compares the filter against the exact string the index recorded.
+    spelled = {
+        os.path.normcase(str(source)): str(source) for source in all_sources or ()
+    }
+
+    where: dict | None = None
+    if include_sources:
+        selected = sorted(spelled.get(path, path) for path in keep)
+        if selected:
+            where = {"source": {"$in": selected}}
+    elif drop:
+        where = {"source": {"$nin": sorted(spelled.get(path, path) for path in drop)}}
+
+    allowed: frozenset[str] | None = None
+    if include_sources:
+        allowed = frozenset(keep)
+    elif drop and all_sources is not None:
+        allowed = frozenset(spelled) - drop
+    return where, allowed
+
+
 def get_retriever(
     vectorstore: Chroma,
     retrieve_k: int,
@@ -137,6 +228,9 @@ def get_retriever(
     rerank_k: int,
     db_directory: str | None = None,
     hybrid_alpha: float = 0.5,
+    include_sources: Sequence[str] | None = None,
+    exclude_sources: Sequence[str] | None = None,
+    all_sources: Sequence[str] | None = None,
 ):
     """Configures and returns the retriever.
 
@@ -156,12 +250,20 @@ def get_retriever(
     Because stage 2 rescores every candidate from scratch, stage 1's *ordering*
     is discarded; only which chunks it selects can affect the answer. That is
     why ``hybrid_alpha`` divides the budget rather than weighting the fusion.
+
+    ``include_sources``/``exclude_sources`` narrow both arms to the same set of
+    files (see :func:`source_filter`); either may be omitted, which searches the
+    whole corpus. ``all_sources`` is that function's ``all_sources``.
     """
     k_dense, k_sparse = split_retrieval_budget(retrieve_k, hybrid_alpha)
+    where, sources = source_filter(include_sources, exclude_sources, all_sources)
 
     def dense_retriever(k: int):
+        search_kwargs: dict = {"k": k}
+        if where is not None:
+            search_kwargs["filter"] = where
         return vectorstore.as_retriever(
-            search_type="similarity", search_kwargs={"k": k}
+            search_type="similarity", search_kwargs=search_kwargs
         )
 
     retrievers: list = []
@@ -169,7 +271,9 @@ def get_retriever(
         retrievers.append(dense_retriever(k_dense))
     if k_sparse:
         try:
-            retrievers.append(get_bm25_retriever(db_directory, k=k_sparse))
+            retrievers.append(
+                get_bm25_retriever(db_directory, k=k_sparse, sources=sources)
+            )
         except FileNotFoundError:
             # A DB built before the BM25 index existed. Degrade to a dense-only
             # pass spending the whole budget rather than failing the query; the
@@ -230,6 +334,9 @@ def build_rag_chain(
     hybrid_alpha: float = 0.5,
     doc_sink: list | None = None,
     chat_history: list | None = None,
+    include_sources: Sequence[str] | None = None,
+    exclude_sources: Sequence[str] | None = None,
+    all_sources: Sequence[str] | None = None,
 ) -> tuple[Runnable, Runnable]:
     """
     Builds the RAG Chain using LangChain Expression Language (LCEL).
@@ -248,6 +355,11 @@ def build_rag_chain(
     question condensed from the follow-up plus the history, and the final
     prompt includes the full history. The chain must then be invoked with a
     dict of ``{"question": str, "chat_history": [...]}``.
+
+    ``include_sources``/``exclude_sources`` restrict retrieval to a set of
+    files for this chain only — the "ask about this document" and "hide this
+    file" controls of a front end — and are passed straight to
+    :func:`get_retriever`, along with ``all_sources``.
     """
     retriever = get_retriever(
         vectorstore,
@@ -256,6 +368,9 @@ def build_rag_chain(
         rerank_k=rerank_k,
         db_directory=db_directory,
         hybrid_alpha=hybrid_alpha,
+        include_sources=include_sources,
+        exclude_sources=exclude_sources,
+        all_sources=all_sources,
     )
     llm = get_llm(llm_provider, llm_model, temperature=llm_temperature)
     prompt = get_prompt_template(system_prompt, with_history=chat_history is not None)

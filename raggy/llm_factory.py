@@ -42,47 +42,91 @@ def _stream_pull(model: str, progress: ProgressCallback) -> None:
             progress(f"pulling {model} ... ({event.status})")
 
 
+def _normalized(model: str) -> str:
+    """The name Ollama stores: a bare name means the ``:latest`` tag."""
+    return model if ":" in model else f"{model}:latest"
+
+
+def _installed_models_via_api() -> set[str]:
+    """Model names already available, asked of the running server.
+
+    The HTTP API is the primary source on purpose. The desktop app on Windows
+    installs the server without putting the ``ollama`` CLI on PATH, so a
+    CLI-only check would refuse to answer questions on a machine where every
+    model is present and the server is up.
+    """
+    from ollama import Client
+
+    response = Client().list()
+    models = getattr(response, "models", None) or response.get("models") or []
+    names: set[str] = set()
+    for entry in models:
+        name = getattr(entry, "model", None) or getattr(entry, "name", None)
+        if name is None and isinstance(entry, dict):
+            name = entry.get("model") or entry.get("name")
+        if name:
+            names.add(_normalized(str(name)))
+    return names
+
+
+def _installed_models_via_cli(exe: str) -> set[str]:
+    """Model names already available, read from ``ollama list``.
+
+    ``ollama list`` reports downloaded models without touching the network. Its
+    output is tab-delimited with the model name in the first column.
+    """
+    listed = subprocess.run([exe, "list"], capture_output=True, text=True, check=False)
+    names: set[str] = set()
+    for line in listed.stdout.splitlines():
+        fields = line.split()
+        if fields:
+            names.add(_normalized(fields[0]))
+    return names
+
+
 def ensure_ollama_model(model: str, progress: ProgressCallback | None = None) -> bool:
     """Pull ``model`` into the local Ollama instance if it isn't already present.
 
-    Returns True if a pull was performed (model was missing), False if the
-    model was already present. Raises ``RuntimeError`` if the ``ollama`` CLI
-    cannot be found or the pull itself fails.
+    Returns True if a pull was performed (model was missing), False if the model
+    was already present. Raises ``RuntimeError`` if no model list can be read
+    (Ollama not running / not installed) or the pull itself fails.
+
+    Presence is checked against the running server first and the CLI second, so
+    a machine where Ollama runs as an app with no CLI on PATH still works.
 
     Without ``progress`` the pull runs as ``ollama pull <model>`` and Ollama
     renders its own output; pass a callback to receive the download progress
     instead and keep the terminal under the caller's control.
     """
-    exe = shutil.which("ollama")
-    if exe is None:
-        raise RuntimeError(
-            "ollama CLI not found on PATH; install Ollama and start `ollama serve`."
-        )
-
-    # `ollama list` cheaply reports downloaded models without contacting the
-    # network, so we skip the pull for models that are already present. Its
-    # output is tab-delimited with the model name in the first column. Names
-    # carry a ``:tag`` suffix (e.g. ``llama3.2:latest``); a bare name in config
-    # implicitly means the ``:latest`` tag, so compare with that normalization.
+    requested = _normalized(model)
+    via_cli = False
     try:
-        listed = subprocess.run(
-            [exe, "list"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError as e:
-        raise RuntimeError(f"Failed to run ollama CLI: {e}") from e
-
-    requested = model if ":" in model else f"{model}:latest"
-    for line in listed.stdout.splitlines():
-        fields = line.split()
-        if fields and fields[0] == requested:
+        if requested in _installed_models_via_api():
             return False
+    except Exception as e:  # noqa: BLE001 - any transport/library failure falls back
+        logger.debug("Could not list installed models over the API: %s", e)
+        via_cli = True
+
+    if via_cli:
+        exe = shutil.which("ollama")
+        if exe is None:
+            raise RuntimeError(
+                "Could not reach the model service and the `ollama` CLI is not on "
+                "PATH. Start Ollama (`ollama serve`, or the desktop app) and try "
+                "again."
+            )
+        try:
+            if requested in _installed_models_via_cli(exe):
+                return False
+        except OSError as cli_error:
+            raise RuntimeError(f"Failed to run ollama CLI: {cli_error}") from cli_error
 
     logger.info("Pulling Ollama model '%s' (first run may take a while)...", model)
     try:
-        if progress is None:
+        # The CLI is only an option when it exists: pulling over the API is
+        # equivalent and works on a machine that installed the desktop app.
+        exe = shutil.which("ollama")
+        if progress is None and exe is not None:
             subprocess.run([exe, "pull", model], check=True)
         else:
             _stream_pull(model, progress)

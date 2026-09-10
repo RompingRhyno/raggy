@@ -1,0 +1,1028 @@
+/* raggy GUI — dark, calm, no external assets.
+   Layout intent (build plan feature 3): the document viewer is the primary
+   pane, the chat is a fixed-width sidebar, and the file list is a collapsible
+   third column so browsing a corpus never competes with reading it. */
+
+:root {
+  --bg: #0e1116;
+  --bg-panel: #151920;
+  --bg-panel-2: #1b2029;
+  --bg-input: #10141a;
+  --border: #262c37;
+  --border-strong: #333b48;
+  --text: #d6dbe3;
+  --text-dim: #9aa3b2;
+  --text-faint: #6f7889;
+  --accent: #58a6ff;
+  --accent-soft: rgba(88, 166, 255, 0.14);
+  --warn: #e3b341;
+  --danger: #f0836b;
+  --ok: #56d4a0;
+  --file-panel-width: 280px;
+  --chat-panel-width: 400px;
+  --radius: 8px;
+  --mono: ui-monospace, "Cascadia Mono", Consolas, "Liberation Mono", monospace;
+}
+
+* { box-sizing: border-box; }
+
+/* `hidden` must always win. The overlay and the modal are laid out with
+   `display: flex`, which beats the user-agent `[hidden] { display: none }` at
+   equal specificity — leaving an invisible full-screen backdrop that swallows
+   every click on the app underneath it. */
+[hidden] { display: none !important; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  overflow: hidden;
+}
+
+h1, h2, h3, h4 { margin: 0; font-weight: 600; }
+code, pre { font-family: var(--mono); }
+
+/* -- toolbar ------------------------------------------------------------ */
+
+.topbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 14px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.brand {
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--accent);
+  user-select: none;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.field { display: flex; align-items: center; gap: 6px; }
+.field.grow { flex: 1 1 auto; }
+.field-label { color: var(--text-faint); font-size: 12px; }
+/* The name field is stacked so its note can sit under the input. */
+.modal-foot .field.grow { flex-direction: column; align-items: flex-start; gap: 3px; }
+.field-note { font-size: 11px; color: var(--text-faint); overflow-wrap: anywhere; }
+
+.topbar-note {
+  margin-left: auto;
+  color: var(--warn);
+  font-size: 12px;
+  text-align: right;
+  max-width: 40ch;
+}
+
+.topbar-note.is-error { color: var(--danger); }
+
+.pdf-host {
+  flex: 1 1 auto;
+  min-height: 0;
+  /* The host, not .viewer, is the PDF scroller: pdfview.js observes it as the
+     IntersectionObserver root, which drives lazy page rendering. */
+  overflow: auto;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+/* -- controls ----------------------------------------------------------- */
+
+.btn {
+  appearance: none;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-panel-2);
+  color: var(--text);
+  padding: 5px 11px;
+  border-radius: 6px;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.btn:hover:not(:disabled) { background: #232935; border-color: #3d4655; }
+.btn:disabled { opacity: 0.5; cursor: default; }
+.btn-small { padding: 3px 8px; font-size: 12px; }
+
+.btn-primary {
+  background: #1d4f86;
+  border-color: #2a68ab;
+  color: #eaf2ff;
+}
+
+.btn-primary:hover:not(:disabled) { background: #245f9e; border-color: #3579c2; }
+
+/* Destructive actions: outlined rather than filled, so the toolbar does not
+   advertise deleting as the obvious next thing to do. */
+.btn-danger { color: var(--danger); border-color: rgba(240, 131, 107, 0.45); }
+.btn-danger:hover:not(:disabled) { background: rgba(240, 131, 107, 0.12); border-color: var(--danger); color: #ffd9cf; }
+
+.btn-ghost { background: transparent; border-color: transparent; color: var(--text-dim); }
+.btn-ghost:hover:not(:disabled) { background: var(--bg-panel-2); color: var(--text); }
+.btn-ghost[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); }
+
+select, input[type="text"], textarea {
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font: inherit;
+  font-size: 13px;
+}
+
+select:focus, input:focus, textarea:focus, .btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+#corpus-select { min-width: 12rem; max-width: 22rem; }
+#corpus-name { flex: 1 1 auto; min-width: 10rem; }
+
+/* -- workspace ---------------------------------------------------------- */
+
+.workspace {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  gap: 10px;
+  padding: 10px;
+}
+
+.panel {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+
+.files-panel { flex: none; width: var(--file-panel-width); }
+.files-panel[hidden] { display: none; }
+.viewer-panel { flex: 1 1 auto; }
+.chat-panel { flex: none; width: var(--chat-panel-width); }
+
+.panel-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  min-height: 42px;
+}
+
+.panel-title {
+  font-size: 13px;
+  letter-spacing: 0.02em;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1 1 auto;
+}
+
+.panel-head-side { display: flex; align-items: center; gap: 8px; flex: none; }
+
+.pill {
+  flex: none;
+  font-size: 11px;
+  color: var(--text-faint);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 1px 8px;
+  white-space: nowrap;
+}
+
+.pdf-controls { display: flex; align-items: center; gap: 4px; }
+.pager { font-size: 12px; color: var(--text-dim); min-width: 5.5rem; text-align: center; }
+
+/* -- file list ---------------------------------------------------------- */
+
+.file-list { overflow-y: auto; padding: 6px; min-height: 0; }
+
+/* A row is two controls side by side: the status toggle and the button that
+   opens the file. It is a grid rather than a flex row so the toggle and the
+   open button can line up their *edges* instead of their baselines — the two
+   hold different things (a box, a line of text) and centring each of them
+   against the other is what puts a dot half a line below its file name.
+
+   The padding is what keeps the toggle's hover border from being clipped: a
+   border drawn outside its content box has nowhere to go in a row that has no
+   space of its own. */
+.file-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 6px;
+  width: 100%;
+  padding: 4px 6px 4px 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+}
+
+/* The part of the row that opens the file: everything except the toggle. */
+.file-open {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  color: var(--text);
+  padding: 2px 2px;
+  cursor: pointer;
+  font: inherit;
+}
+
+/* The name row: name, chunk count, kind. */
+.file-row { display: flex; align-items: baseline; gap: 8px; width: 100%; }
+
+/* `.file-open` is a button but not a `.btn`, so it needs the focus ring the
+   toolbar rules give everything else. */
+.file-open:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-radius: 4px; }
+
+.file-item:hover { background: var(--bg-panel-2); }
+.file-item.is-current { background: var(--accent-soft); border-color: rgba(88, 166, 255, 0.35); }
+.file-item .file-name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-item .file-meta { flex: none; font-size: 11px; color: var(--text-faint); }
+.file-item .file-chunks { flex: none; font-size: 11px; color: var(--text-dim); min-width: 3.2rem; text-align: right; }
+/* Why a file failed: its own line under the name, clamped so a long error
+   cannot push the rest of the list off screen. */
+.file-item .file-detail {
+  display: block;
+  font-size: 11px;
+  color: var(--danger);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Files with no text: dimmed when shown, so they read as "nothing to read here"
+   rather than as a document of equal standing. */
+.file-item.is-empty .file-name { color: var(--text-dim); }
+/* An entry whose file is gone: inert, and visibly so. */
+.file-item.is-missing { opacity: 0.6; }
+.file-item.is-missing:hover { background: transparent; }
+.file-item.is-missing .file-open { cursor: not-allowed; }
+.file-item.is-missing .file-name { text-decoration: line-through; }
+
+/* Hidden from context. The red dot says it; the dimmed name says which file it
+   was, so the row still reads as a file the list is telling you about rather
+   than as an empty gap. */
+.file-item.is-hidden-context .file-name { color: var(--text-faint); }
+.file-item.is-hidden-context .file-chunks { color: var(--text-faint); }
+
+/* Separates the files that produced no text from the rest, so the bottom run
+   reads as a group rather than as more of the list. */
+.file-group {
+  margin: 8px 0 2px;
+  padding: 0 8px;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+/* -- the file list while it is loading ----------------------------------
+   Listing a corpus walks its index and OCRs its images, which on a large one
+   takes seconds: the pane says so instead of asserting the corpus is empty.
+   The bars stand where rows will appear, so the wait reads as the list filling
+   in rather than as a message that happens to be replaced later. */
+
+.file-loading { padding: 4px 2px; }
+
+.file-skeleton-row {
+  height: 15px;
+  margin-bottom: 9px;
+  border-radius: 4px;
+  background: linear-gradient(90deg, var(--bg-panel-2) 25%, #232a35 50%, var(--bg-panel-2) 75%);
+  background-size: 200% 100%;
+  animation: file-shimmer 1.3s ease-in-out infinite;
+}
+
+/* Ragged lengths, so the block reads as text waiting to arrive. */
+.file-skeleton-row:nth-child(2) { width: 82%; animation-delay: 0.12s; }
+.file-skeleton-row:nth-child(3) { width: 64%; animation-delay: 0.24s; }
+
+.file-loading-text {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 10px;
+  padding: 0 2px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+@keyframes file-shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* The row that stands in for hidden files, so the list does not look truncated. */
+.file-hidden-note {
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  color: var(--text-faint);
+  font-size: 11px;
+  padding: 5px 8px;
+  cursor: pointer;
+}
+
+.file-hidden-note:hover { color: var(--text-dim); border-color: var(--border-strong); }
+
+#empty-files-toggle.is-on { background: var(--accent-soft); color: var(--accent); }
+
+/* -- context toggle ------------------------------------------------------
+   The status marker doubles as the button that takes a file in or out of
+   context. Green means answers may cite it, red means they may not.
+
+   At rest it is a bare dot. Hovering *anywhere on the row* draws the button
+   around it — hovering the row is how a user says "I am looking at this file",
+   and the box appearing then is what makes the dot read as a control instead of
+   as a legend. Hovering the dot itself also works, but is not required: a 24px
+   target is still smaller than the thing it sits in.
+
+   The button is sized to nearly the row's own height, so its border sits inside
+   the row rather than inside the file name. That size is why the dot has padding
+   of its own: the box is what grew, and the dot stays centred in it, on the same
+   axis as the name it belongs to. */
+
+.context-toggle {
+  align-self: start;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  margin-left: 3px;
+  padding: 0;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  cursor: pointer;
+  appearance: none;
+  font: inherit;
+  color: inherit;
+}
+
+.context-toggle::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+
+.context-toggle.status-indexed::before { background: var(--ok); }
+.context-toggle.status-failed::before { background: var(--danger); }
+.context-toggle.status-new::before { background: var(--accent); }
+.context-toggle.status-removed::before { background: var(--warn); }
+
+/* The row's hover, which is the one a user actually triggers. */
+.file-item:hover .context-toggle,
+/* And the button's own, for a pointer that goes straight to it. */
+.context-toggle:hover,
+.context-toggle:focus-visible {
+  background: var(--bg-panel-2);
+  border-color: var(--border-strong);
+}
+
+/* The current row is tinted, so the button on it needs a background that reads
+   against the tint rather than a second unrelated shade. */
+.file-item.is-current:hover .context-toggle,
+.file-item.is-current .context-toggle:hover,
+.file-item.is-current .context-toggle:focus-visible {
+  background: var(--bg-panel);
+}
+
+/* A row whose file is gone offers nothing, so its button must not look
+   pressable. */
+.file-item.is-missing:hover .context-toggle { border-color: transparent; background: transparent; }
+
+.context-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* Hidden from context: the dot turns red — the one state that overrides the
+   file's own status colour, because "answers may not cite this" is the more
+   important thing to see at a glance. */
+.context-toggle.is-hidden::before { background: var(--danger); }
+
+.file-item:hover .context-toggle.is-hidden,
+.context-toggle.is-hidden:hover,
+.context-toggle.is-hidden:focus-visible { border-color: var(--danger); }
+
+/* -- viewer ------------------------------------------------------------- */
+
+.viewer {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  scrollbar-color: var(--border-strong) transparent;
+  /* A column flex container, so a viewer's own scroller can claim the leftover
+     height with flex instead of relying on height:100% chains. */
+  display: flex;
+  flex-direction: column;
+}
+
+.empty-state {
+  max-width: 46ch;
+  margin: 12vh auto 0;
+  text-align: center;
+  color: var(--text-dim);
+  padding: 0 20px;
+}
+
+.empty-state h2 { font-size: 16px; color: var(--text); margin-bottom: 8px; }
+.empty-state p { margin: 0 0 10px; }
+.empty-state .btn { margin-top: 6px; }
+
+.error-box {
+  margin: 12px;
+  padding: 10px 12px;
+  border: 1px solid rgba(240, 131, 107, 0.4);
+  background: rgba(240, 131, 107, 0.08);
+  border-radius: 6px;
+  color: #ffd9cf;
+  font-size: 13px;
+}
+
+.error-box .error-hint { color: var(--text-dim); margin-top: 4px; }
+
+.note-line {
+  margin: 10px 12px 0;
+  padding: 7px 10px;
+  border-left: 2px solid var(--accent);
+  background: var(--accent-soft);
+  border-radius: 0 6px 6px 0;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+/* -- pdf viewer --------------------------------------------------------- */
+
+.pdf-surface { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 12px; }
+
+.pdf-page {
+  position: relative;
+  flex: none;
+  background: #fff;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+  border-radius: 2px;
+  /* The placeholder mirrors the real page box so the scrollbar and the jump
+     target are already correct before the page has been rendered. */
+  outline: 1px solid #2a3040;
+}
+
+.pdf-page canvas { display: block; position: absolute; top: 0; left: 0; }
+
+.pdf-page-label {
+  position: absolute;
+  bottom: -1.15rem;
+  right: 0;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.pdf-placeholder {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #666;
+  font-size: 12px;
+}
+
+.pdf-target { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/*
+ * The text layer sits over the rendered canvas and must line up with the glyphs
+ * pixel for pixel: one absolutely positioned span per text run, each carrying the
+ * transform pdf.js measured from the PDF, with its own text transparent so only
+ * the canvas shows. This is pdf.js's own rule set (web/pdf_viewer.css); it is
+ * repeated here because the viewer does not load that stylesheet — and without
+ * the span rules every span is static content stacked at the page's top-left
+ * corner, which is exactly what "text in the corner" looks like.
+ *
+ * `--font-height`, `--scale-x` and `--rotate` are set inline per span by
+ * TextLayer; `--total-scale-factor` is read by the font-size calc and is set
+ * from the render scale in pdfview.js.
+ */
+.pdf-surface .textLayer {
+  position: absolute;
+  inset: 0;
+  overflow: clip;
+  opacity: 1;
+  line-height: 1;
+  letter-spacing: normal;
+  word-spacing: normal;
+  text-align: initial;
+  text-size-adjust: none;
+  forced-color-adjust: none;
+  transform-origin: 0 0;
+  caret-color: CanvasText;
+  z-index: 0;
+  color-scheme: only light;
+  --min-font-size: 1;
+  --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+  --min-font-size-inv: calc(1 / var(--min-font-size));
+}
+
+.pdf-surface .textLayer span,
+.pdf-surface .textLayer br {
+  position: absolute;
+  color: transparent;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+  user-select: text;
+}
+
+/* pdf.js's own rule also names `span` inside a `.markedContent` wrapper, which
+   it creates for marked-content items (tagged PDFs: headings, tables, figures).
+   Those items only appear when `getTextContent` is called with
+   `includeMarkedContent: true`, which it defaults to false and the viewer here
+   does not pass — so today no such wrapper exists. Kept because it is pdf.js's
+   own selector and the cost of being wrong is every run in the wrapper silently
+   losing its size and transform, which puts the overlay text off its glyphs. */
+.pdf-surface .textLayer > :not(.markedContent),
+.pdf-surface .textLayer .markedContent span:not(.markedContent) {
+  z-index: 1;
+  --font-height: 0;
+  --scale-x: 1;
+  --rotate: 0deg;
+  font-size: calc(var(--text-scale-factor) * var(--font-height));
+  transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
+}
+
+.pdf-surface .textLayer .markedContent { display: contents; }
+
+/* Selection has to be visible even though the text itself is not. */
+.pdf-surface .textLayer ::selection {
+  background: rgba(88, 166, 255, 0.35);
+}
+
+/* Our own search highlight: a mark placed inside the text layer inherits the
+   absolutely positioned span geometry, so it lands on the words it covers.
+
+   It must stay *inline* inside its span. The span is what pdf.js positions, so a
+   mark that is itself positioned — or a block — is lifted out of the text flow
+   and, having no top/left of its own, collapses onto its containing block's
+   origin: every highlighted fragment then piles up at the same point on the page
+   instead of sitting on the words it covers.
+
+   Its own text must stay invisible, like the span's. The browser's default
+   `mark { color: black }` is a UA rule that beats the transparent colour the
+   span sets, so without this the cited words are painted a second time in black
+   over the canvas — doubled, slightly offset text wherever the text layer and
+   the rendered glyphs are not pixel-identical. Only the background is ours. */
+.pdf-highlight {
+  color: transparent;
+  background: rgba(255, 214, 0, 0.42);
+  border-radius: 2px;
+  pointer-events: none;
+  mix-blend-mode: multiply;
+}
+
+.pdf-highlight.is-current {
+  background: rgba(255, 140, 0, 0.55);
+  box-shadow: 0 0 0 1.5px rgba(255, 140, 0, 0.9);
+}
+
+.pdf-progress {
+  position: sticky;
+  top: 0;
+  left: 0;
+  z-index: 3;
+  padding: 3px 10px;
+  font-size: 11px;
+  color: var(--text-dim);
+  background: rgba(14, 17, 22, 0.85);
+  backdrop-filter: blur(2px);
+  width: fit-content;
+}
+
+/* -- text viewer -------------------------------------------------------- */
+
+.text-scroll { flex: 1 1 auto; min-height: 0; overflow: auto; }
+.text-lines { margin: 0; padding: 8px 0; font-size: 12.5px; line-height: 1.55; counter-reset: line; }
+
+.text-line { display: flex; counter-increment: line; white-space: pre-wrap; word-break: break-word; }
+.text-line::before {
+  content: counter(line);
+  flex: none;
+  width: 4rem;
+  padding-right: 10px;
+  text-align: right;
+  color: var(--text-faint);
+  user-select: none;
+  border-right: 1px solid var(--border);
+  margin-right: 12px;
+}
+
+.text-line-body { flex: 1 1 auto; min-width: 0; }
+.text-line.is-target { background: rgba(88, 166, 255, 0.12); }
+
+/* -- html viewer -------------------------------------------------------- */
+
+.html-scroll { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 20px 24px; }
+
+.html-body {
+  max-width: 78ch;
+  margin: 0 auto;
+  color: #e6e9ef;
+}
+
+.html-body a { color: var(--accent); }
+.html-body img { max-width: 100%; height: auto; }
+.html-body h1 { font-size: 1.6em; margin: 0.8em 0 0.4em; }
+.html-body h2 { font-size: 1.35em; margin: 1.2em 0 0.4em; }
+.html-body h3 { font-size: 1.15em; margin: 1.1em 0 0.35em; }
+.html-body p, .html-body ul, .html-body ol, .html-body table { margin: 0 0 0.85em; }
+.html-body ul, .html-body ol { padding-left: 1.4em; }
+.html-body table { border-collapse: collapse; width: 100%; }
+.html-body th, .html-body td { border: 1px solid var(--border-strong); padding: 4px 8px; text-align: left; }
+.html-body hr { border: 0; border-top: 1px solid var(--border); }
+.html-body blockquote {
+  margin: 0 0 0.85em;
+  padding-left: 12px;
+  border-left: 2px solid var(--border-strong);
+  color: var(--text-dim);
+}
+
+/* -- image viewer ------------------------------------------------------- */
+
+.image-layout { display: flex; flex-direction: column; gap: 10px; padding: 14px; height: 100%; }
+.image-layout .note-line { margin: 0; }
+.image-row { display: flex; gap: 14px; align-items: flex-start; flex: 1 1 auto; min-height: 0; }
+/* No OCR text means no panel, and the image gets the whole row. */
+.image-row-solo { justify-content: center; }
+.image-stage { flex: 1 1 auto; min-width: 0; text-align: center; }
+.image-stage img { max-width: 100%; border-radius: 4px; background: #fff; }
+.ocr-panel {
+  flex: none;
+  width: 34%;
+  min-width: 240px;
+  max-height: 100%;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-panel-2);
+}
+.ocr-head { padding: 7px 10px; border-bottom: 1px solid var(--border); font-size: 12px; color: var(--text-dim); }
+.ocr-text { margin: 0; padding: 10px; overflow: auto; font-size: 12px; line-height: 1.55; white-space: pre-wrap; color: var(--text); }
+
+/* -- chat --------------------------------------------------------------- */
+
+.chat-log { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 10px; }
+
+.msg { margin-bottom: 12px; }
+.msg-role { font-size: 11px; color: var(--text-faint); margin-bottom: 4px; letter-spacing: 0.04em; text-transform: uppercase; }
+
+.msg-question {
+  background: var(--bg-panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.msg-answer { word-break: break-word; }
+.msg-answer > :first-child { margin-top: 0; }
+.msg-answer > :last-child { margin-bottom: 0; }
+.msg-answer p { margin: 0 0 0.7em; }
+.msg-answer h1, .msg-answer h2, .msg-answer h3 { margin: 0.9em 0 0.4em; font-size: 1.05em; }
+.msg-answer ul, .msg-answer ol { margin: 0 0 0.7em; padding-left: 1.3em; }
+.msg-answer li { margin: 0.15em 0; }
+.msg-answer pre {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  overflow-x: auto;
+  font-size: 12px;
+}
+.msg-answer code {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+  font-size: 12.5px;
+}
+.msg-answer pre code { background: none; border: 0; padding: 0; }
+.msg-answer blockquote {
+  margin: 0 0 0.7em;
+  padding-left: 10px;
+  border-left: 2px solid var(--border-strong);
+  color: var(--text-dim);
+}
+.msg-answer hr { border: 0; border-top: 1px solid var(--border); margin: 0.9em 0; }
+.msg-answer table { border-collapse: collapse; margin: 0 0 0.7em; }
+.msg-answer th, .msg-answer td { border: 1px solid var(--border-strong); padding: 3px 7px; }
+.msg-answer a { color: var(--accent); }
+
+.msg-error { color: #ffd9cf; background: rgba(240, 131, 107, 0.08); border-radius: 6px; padding: 8px 10px; }
+.msg-error .error-hint { color: var(--text-dim); margin-top: 4px; }
+
+.retrieving { display: flex; align-items: center; gap: 8px; color: var(--text-dim); font-size: 13px; }
+
+/* -- citations ---------------------------------------------------------- */
+
+.citations { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px; }
+.citations-title { font-size: 11px; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 6px; }
+
+.citation {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  color: var(--text);
+  background: var(--bg-panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 9px;
+  margin-bottom: 6px;
+  cursor: pointer;
+}
+
+.citation:hover { border-color: rgba(88, 166, 255, 0.5); background: #1e2530; }
+.citation.is-current { border-color: var(--accent); }
+.citation-static { cursor: default; opacity: 0.85; }
+
+.citation-head { display: flex; align-items: baseline; gap: 8px; }
+.citation-label { flex: 1 1 auto; font-size: 12.5px; color: var(--accent); overflow: hidden; text-overflow: ellipsis; }
+.citation-static .citation-label { color: var(--text-dim); }
+.citation-score { flex: none; font-size: 11px; color: var(--text-faint); }
+.citation-snippet { display: block; margin-top: 4px; font-size: 12px; color: var(--text-dim); }
+.citation-note { display: block; margin-top: 4px; font-size: 11px; color: var(--warn); }
+
+/* -- chat form ---------------------------------------------------------- */
+
+.chat-form { flex: none; border-top: 1px solid var(--border); padding: 8px; }
+
+/* What the question is asked of, above the box it is typed in: the choice
+   belongs with the question, not buried in the file list on the other side of
+   the window. */
+.ask-scope {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+
+.ask-scope .btn { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ask-scope .btn.is-on { background: var(--accent-soft); color: var(--accent); }
+/* A disabled control that still explains itself: the default 0.5 opacity makes
+   the "This file" label unreadable precisely when the user needs to read it. */
+.ask-scope .btn:disabled { opacity: 0.75; }
+.ask-scope-note { font-size: 11px; color: var(--text-faint); }
+
+.chat-form textarea { width: 100%; resize: vertical; min-height: 3.4rem; max-height: 12rem; }
+.chat-actions { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+.chat-state { flex: 1 1 auto; font-size: 12px; color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.blink { animation: blink 1.4s ease-in-out infinite; }
+
+@keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+
+/* -- overlays ----------------------------------------------------------- */
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(8, 10, 14, 0.72);
+  backdrop-filter: blur(2px);
+}
+
+.overlay-card {
+  min-width: 22rem;
+  max-width: 34rem;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  padding: 22px 24px;
+  text-align: center;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.55);
+}
+
+.overlay-title { font-size: 15px; margin-bottom: 6px; }
+.overlay-message { margin: 8px 0 4px; color: var(--text); font-size: 13px; min-height: 1.4em; word-break: break-word; }
+.overlay-elapsed { margin: 0 0 14px; color: var(--text-faint); font-size: 12px; }
+.overlay-foot { margin: 12px 0 0; color: var(--text-faint); font-size: 11px; }
+
+.spinner {
+  width: 26px;
+  height: 26px;
+  margin: 0 auto 12px;
+  border: 3px solid var(--border-strong);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+}
+
+.spinner-inline { width: 13px; height: 13px; margin: 0; border-width: 2px; }
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.modal-backdrop { position: absolute; inset: 0; background: rgba(8, 10, 14, 0.7); }
+
+.modal-card {
+  position: relative;
+  width: min(46rem, 92vw);
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  padding: 16px 18px;
+  box-shadow: 0 14px 44px rgba(0, 0, 0, 0.6);
+}
+
+.modal-head { display: flex; align-items: center; gap: 10px; }
+.modal-hint { color: var(--text-dim); font-size: 12px; margin: 8px 0 12px; }
+
+/* Inside a confirmation, the explanation is the thing being read: it carries the
+   reassurance ("your files are not deleted") and must not be the faintest text in
+   the box. */
+.modal-hint-plain { margin-top: 10px; color: var(--text); opacity: 0.85; }
+.modal-hint-plain strong { color: var(--text); }
+
+/* A confirmation asks one question, so it does not need a browser in it. */
+.modal-card-narrow { width: min(30rem, 92vw); }
+.modal-strong { color: var(--text); font-weight: 600; word-break: break-word; }
+
+.modal-warning {
+  margin: 12px 0 0;
+  font-size: 13px;
+  color: var(--text);
+  line-height: 1.5;
+}
+
+.modal-foot-end { justify-content: flex-end; }
+
+.browse-path-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+
+.browse-path {
+  flex: 1 1 auto;
+  overflow-x: auto;
+  white-space: nowrap;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.browse-selection { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.browse-selection:empty { display: none; }
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--accent-soft);
+  border: 1px solid rgba(88, 166, 255, 0.4);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 2px 6px 2px 10px;
+  font-size: 12px;
+}
+
+.chip button {
+  background: none;
+  border: 0;
+  color: var(--text-dim);
+  cursor: pointer;
+  font: inherit;
+  padding: 0 2px;
+}
+
+.chip button:hover { color: var(--danger); }
+.chip-remove { font-size: 14px; line-height: 1; }
+
+.browse-list {
+  list-style: none;
+  margin: 0;
+  padding: 6px;
+  overflow-y: auto;
+  min-height: 8rem;
+  flex: 1 1 auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-input);
+}
+
+.browse-row { display: flex; align-items: center; gap: 8px; padding: 3px 4px; border-radius: 5px; }
+.browse-row:hover { background: var(--bg-panel-2); }
+.browse-row label { display: flex; align-items: center; gap: 8px; flex: 1 1 auto; cursor: pointer; min-width: 0; }
+.browse-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.browse-name.is-dir { color: var(--accent); cursor: pointer; }
+.browse-file { color: var(--text-faint); }
+.browse-empty { color: var(--text-faint); font-size: 12px; padding: 6px; }
+
+.modal-foot { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
+
+/* -- refresh report ----------------------------------------------------- */
+
+.report { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 4px 14px 20px; max-width: 70rem; }
+
+.count-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr));
+  gap: 8px;
+  margin: 12px 0 16px;
+}
+
+.count-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-panel-2);
+}
+
+.count-tile.is-bad { border-color: rgba(240, 131, 107, 0.5); }
+.count-value { font-size: 20px; font-weight: 600; }
+.count-tile.is-bad .count-value { color: var(--danger); }
+.count-label { font-size: 11px; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.03em; }
+
+.detail-section {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin-bottom: 8px;
+  background: var(--bg-panel-2);
+}
+
+.detail-section > summary {
+  cursor: pointer;
+  padding: 7px 10px;
+  font-size: 12.5px;
+  color: var(--text);
+  list-style: none;
+}
+
+.detail-section > summary::-webkit-details-marker { display: none; }
+.detail-section > summary::before { content: "▸ "; color: var(--text-faint); }
+.detail-section[open] > summary::before { content: "▾ "; }
+.detail-section[open] > summary { border-bottom: 1px solid var(--border); }
+
+.detail-list { list-style: none; margin: 0; padding: 8px 10px; font-size: 12px; }
+.detail-list li { display: flex; flex-wrap: wrap; gap: 8px; padding: 2px 0; }
+.detail-name { color: var(--text); word-break: break-word; }
+.detail-note { color: var(--text-faint); }
+.detail-error { color: var(--danger); word-break: break-word; }
+
+/* -- narrow windows ----------------------------------------------------- */
+
+@media (max-width: 1180px) {
+  :root { --chat-panel-width: 340px; --file-panel-width: 220px; }
+}
+
+@media (max-width: 940px) {
+  .workspace { flex-wrap: wrap; overflow-y: auto; }
+  .viewer-panel { flex: 1 1 100%; min-height: 55vh; }
+  .chat-panel { flex: 1 1 100%; width: auto; min-height: 40vh; }
+  .files-panel { flex: 1 1 100%; width: auto; max-height: 30vh; }
+}
